@@ -1,205 +1,149 @@
+import matplotlib.pyplot as plt
+import numpy as np
 import torch.nn as nn
-import torchvision.models
 from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms, datasets, models
-import torchvision.utils
 import torch
-import pandas as pd
+from torchinfo import summary
 from PIL import Image
 from torchvision.transforms import ToTensor
 from glob import glob
 from torch.utils.data import Dataset, DataLoader
+from collections import defaultdict
 import torch.nn.functional as F
 from tqdm.auto import tqdm
-import os
-import torchmetrics
-import timm
+import segmentation_models_pytorch as smp
 import time
 import datetime
 from sklearn.metrics import roc_auc_score
 from sklearn.metrics import confusion_matrix
 from sklearn.metrics import f1_score
-
-
+import os
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 batch_size = 1
 image_count = 50
-img_size = 256
+img_size = 512
 tf = ToTensor()
 
 
-class CustomDataset(Dataset):
-    def __init__(self, id, image_list, label_list):
-        self.img_path = image_list
+def expand2square(pil_img, background_color):
+    width, height = pil_img.size
+    if width == height:
+        return pil_img
+    elif width > height:
+        result = Image.new(pil_img.mode, (width, width), background_color)
+        result.paste(pil_img, (0, (width - height) // 2))
+        return result
+    else:
+        result = Image.new(pil_img.mode, (height, height), background_color)
+        result.paste(pil_img, ((height - width) // 2, 0))
+        return result
 
+
+class CustomDataset(Dataset):
+    def __init__(self, image_list, label_list, file_list):
+        self.img_path = image_list
         self.label = label_list
-        self.id = id
+        self.file_list = file_list
 
     def __len__(self):
         return len(self.label)
 
     def __getitem__(self, idx):
-        id_tensor = self.id[idx]
         image_tensor = self.img_path[idx]
-
         label_tensor = self.label[idx]
-        return id_tensor, image_tensor, label_tensor
+        path = os.path.splitext(os.path.basename(self.file_list[idx]))[0]
+        return image_tensor, label_tensor, path
 
 
-class FeatureExtractor(nn.Module):
-    """Feature extoractor block"""
+def data_load(image_list):
+    tumor_mask_list = [f.replace('/image/', '/polygon/TP_tumor/')
+                       for f in image_list]
+    normal_mask_list = [
+        f.replace('/image/', '/polygon/NT_normal/') for f in image_list]
 
-    def __init__(self):
-        super(FeatureExtractor, self).__init__()
-        cnn1 = timm.create_model('efficientnet_b2', pretrained=True)
-        self.feature_ex = nn.Sequential(*list(cnn1.children())[:-1])
+    image = torch.zeros((len(image_list), 3, img_size, img_size))
+    mask = torch.zeros((len(image_list), 3, img_size, img_size))
 
-    def forward(self, inputs):
-        features = self.feature_ex(inputs)
+    for i in tqdm(range(len(image_list))):
+        img = 1 - \
+            tf(np.array(expand2square(Image.open(
+                image_list[i]), (255, 255, 255)).resize((img_size, img_size))))
+        msk_tumor = np.array((expand2square(Image.open(
+            tumor_mask_list[i]), (0, 0, 0)).convert('L')).resize((img_size, img_size)))
+        msk_normal = np.array((expand2square(Image.open(
+            normal_mask_list[i]), (0, 0, 0)).convert('L')).resize((img_size, img_size)))
+        msk_back = np.where((msk_tumor+msk_normal) == 0, 255, 0)
+        image[i] = img
+        mask[i, 0] = tf(msk_back)
+        mask[i, 1] = tf(msk_tumor)
+        mask[i, 2] = tf(msk_normal)
 
-        return features
-
-
-class AttentionMILModel(nn.Module):
-    def __init__(self, num_classes, image_feature_dim, feature_extractor_scale1: FeatureExtractor):
-        super(AttentionMILModel, self).__init__()
-        self.num_classes = num_classes
-        self.image_feature_dim = image_feature_dim
-
-        # Remove the classification head of the CNN model
-        self.feature_extractor = feature_extractor_scale1
-
-        # Attention mechanism
-        self.attention = nn.Sequential(
-            nn.Linear(image_feature_dim, 128),
-            nn.Tanh(),
-            nn.Linear(128, 1)
-        )
-
-        # Classification layer
-        self.classification_layer = nn.Linear(image_feature_dim, num_classes)
-        self.dropout = torch.nn.Dropout(0.2)
-
-    def forward(self, inputs):
-        batch_size, num_tiles, channels, height, width = inputs.size()
-
-        # Flatten the inputs
-        inputs = inputs.view(-1, channels, height, width)
-
-        # Feature extraction using the pre-trained CNN
-        # Shape: (batch_size * num_tiles, 2048, 1, 1)
-        features = self.feature_extractor(inputs)
-
-        # Reshape features
-        # Shape: (batch_size, num_tiles, 2048)
-        features = features.view(batch_size, num_tiles, -1)
-
-        # Attention mechanism
-        # Shape: (batch_size, num_tiles, 1)
-        attention_weights = self.attention(features)
-        # Normalize attention weights
-        attention_weights = F.softmax(attention_weights, dim=1)
-
-        # Apply attention weights to features
-        # Shape: (batch_size, 2048)
-        attended_features = torch.sum(features * attention_weights, dim=1)
-        attended_features = self.dropout(attended_features)
-        attended_features = F.relu(attended_features)
-        # Classification layer
-        # Shape: (batch_size, num_classes)
-        logits = self.classification_layer(attended_features)
-
-        return logits
+    dataset = CustomDataset(image, mask, image_list)
+    dataloader = DataLoader(dataset, batch_size=batch_size,
+                            shuffle=True, drop_last=True)
+    return dataloader
 
 
-def predict(label_data):
+def dice_loss(pred, target, num_classes=3):
+    smooth = 1.
+    dice_per_class = torch.zeros(num_classes).to(pred.device)
+
+    for class_id in range(num_classes):
+        pred_class = pred[:, class_id, ...]
+        target_class = target[:, class_id, ...]
+
+        intersection = torch.sum(pred_class * target_class)
+        A_sum = torch.sum(pred_class * pred_class)
+        B_sum = torch.sum(target_class * target_class)
+
+        dice_per_class[class_id] = 1 - \
+            (2. * intersection + smooth) / (A_sum + B_sum + smooth)
+
+    return dice_per_class
+
+
+def Predict(image_list):
     start = time.time()
     d = datetime.datetime.now()
     now_time = f"{d.year}-{d.month}-{d.day} {d.hour}:{d.minute}:{d.second}"
     print(f'[Predict Start]')
     print(f'Predict Start Time : {now_time}')
-    test_label_list = []
-    test_id_list = []
-    test_image_list = glob('./frame/*')
-    test_image_tensor = torch.empty(
-        (len(test_image_list), image_count, 3, img_size, img_size))
-    for i in range(len(test_image_list)):
-        folder_name = os.path.basename(test_image_list[i])
-        dst_label = label_data.loc[label_data['일련번호'] == int(folder_name[:-1])]
-        dst_label = dst_label.loc[dst_label['구분값']
-                                  == int(folder_name[-1])].reset_index()
-        label = int(dst_label.loc[0]['OTE 원인'])
-        test_id_list.append(folder_name)
-        test_label_list.append(label-1)
-        image_file_list = glob(test_image_list[i]+'/*.jpg')
-        if len(image_file_list) > image_count:
-            count = 0
-            for index in range(image_count):
-                image = 1 - \
-                    tf(Image.open(image_file_list[index]).resize(
-                        (img_size, img_size)))
-                test_image_tensor[i, count] = image
-                count += 1
-        else:
-            count = 0
-            for index in range(len(image_file_list)):
-                image = 1 - \
-                    tf(Image.open(image_file_list[index]).resize(
-                        (img_size, img_size)))
-                test_image_tensor[i, count] = image
-                count += 1
-            for j in range(image_count-count):
-                image = 1 - \
-                    tf(Image.open(image_file_list[j]).resize(
-                        (img_size, img_size)))
-                test_image_tensor[i, count] = image
-                count += 1
-
-    test_dataset = CustomDataset(test_id_list, test_image_tensor, F.one_hot(
-        torch.tensor(test_label_list).to(torch.int64)))
-    test_dataloader = DataLoader(
-        test_dataset, batch_size=batch_size, shuffle=True, drop_last=True)
-    Feature_Extractor = FeatureExtractor()
-    model = AttentionMILModel(3, 1408, Feature_Extractor)
-    model = model.to(device)
-    accuracy = torchmetrics.Accuracy(
-        task="multiclass", num_classes=3).to(device)
-    model.load_state_dict(torch.load('./model/Best_model.pt'))
-    total_y = torch.zeros((len(test_dataloader), 3)).to(device)
-    total_prob = torch.zeros((len(test_dataloader), 3)).to(device)
+    print('Data load...')
+    dataloader = data_load(image_list)
+    model = smp.UnetPlusPlus(
+        'efficientnet-b6', in_channels=3, classes=3).to(device)
+    model.load_state_dict(torch.load('../../model/Best_model.pt'))
+    total_path = []
+    print('predict...')
+    total_prob = torch.zeros(
+        (len(dataloader), 3, img_size, img_size)).to(device)
+    total_y = torch.zeros((len(dataloader), 3, img_size, img_size)).to(device)
+    total_dice = torch.zeros((len(dataloader), 3)).to(device)
     model.eval()
     count = 0
     val_running_loss = 0.0
     acc_loss = 0
-    test = tqdm(test_dataloader)
-    path_list = []
+    test = tqdm(dataloader)
+
     with torch.no_grad():
-        for path, x, y in test:
+        for x, y, path in test:
             y = y.to(device).float()
             x = x.to(device).float()
             predict = model(x).to(device)
-            cost = F.cross_entropy(predict.softmax(dim=1), y)  # cost 구함
-            acc = accuracy(predict.softmax(
-                dim=1).argmax(dim=1), y.argmax(dim=1))
+            cost = torch.mean(dice_loss(predict, y, num_classes=3))  # cost 구함
+            acc = 1-torch.mean(dice_loss(predict, y, num_classes=3))
             val_running_loss += cost.item()
             acc_loss += acc
-            prob_pred = predict.softmax(dim=1)
+            prob_pred = predict
+            total_path.append(path)
+            total_prob[count] = predict.squeeze(dim=1)
             total_y[count] = y.squeeze(dim=1)
-            total_prob[count] = prob_pred
+            total_dice[count] = dice_loss(predict, y, num_classes=3)
             count += 1
-            path_list.append(path)
-    test_score = roc_auc_score(total_y.cpu().argmax(
-        axis=1), total_prob.cpu(), multi_class='ovr')
-    print(f'total AUC score= {test_score}')
-    cm = confusion_matrix(total_y.cpu().argmax(
-        axis=1), total_prob.cpu().argmax(axis=1))
-    print(f'total confusion matrix array : \n {cm}')
-    f1 = f1_score(total_y.cpu().argmax(axis=1),
-                  total_prob.cpu().argmax(axis=1), average='macro')
-    print(f'total f1-score= {f1}')
     end = time.time()
     d = datetime.datetime.now()
     now_time = f"{d.year}-{d.month}-{d.day} {d.hour}:{d.minute}:{d.second}"
     print(f'Predict Time : {now_time}s Time taken : {end-start}')
     print(f'[Predict End]')
-    return path_list, total_y.cpu().argmax(axis=1), total_prob.cpu().argmax(axis=1), cm
+    return total_path, total_y.cpu(), total_prob.cpu(), total_dice.cpu()
